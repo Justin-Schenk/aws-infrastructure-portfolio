@@ -1,0 +1,194 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Minecraft Java Edition server on EC2 with a persistent EBS volume for
+  world data. The server JAR is downloaded from Mojang's version manifest
+  API at launch and managed as a systemd service with graceful shutdown
+  handling. Derived from CS312 System Administration coursework at Oregon
+  State University; extended here with parameterized version selection,
+  EBS persistence, and CloudFormation cross-stack VPC integration.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large]
+    Description: >
+      Minecraft needs at least 2GB RAM. t3.medium (4GB) is the minimum
+      comfortable size for a small server (1-5 players).
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+
+  SSHAllowedCIDR:
+    Type: String
+    Default: 0.0.0.0/0
+
+  MinecraftVersion:
+    Type: String
+    Default: "1.21.4"
+    Description: Minecraft Java Edition version to deploy.
+
+  ServerMemoryMB:
+    Type: Number
+    Default: 2048
+    Description: JVM heap size in MB (-Xmx). Keep below total instance RAM.
+
+  WorldVolumeSize:
+    Type: Number
+    Default: 10
+    Description: Size in GB for the EBS volume storing world data.
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+
+  MinecraftSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Minecraft server - game port and SSH
+      VpcId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHAllowedCIDR
+        - IpProtocol: tcp
+          FromPort: 25565
+          ToPort: 25565
+          CidrIp: 0.0.0.0/0
+          Description: Minecraft Java Edition default port
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-minecraft-sg
+
+  # Persistent EBS volume for world data. Survives instance termination
+  # as long as the volume's DeletionPolicy is Retain (set below).
+  WorldVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Size: !Ref WorldVolumeSize
+      VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-minecraft-world
+
+  MinecraftInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-PublicSubnet1
+      SecurityGroupIds:
+        - !Ref MinecraftSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+
+          # Java 21 is required for Minecraft 1.21+
+          dnf install -y java-21-amazon-corretto-headless jq
+
+          # Mount the world data EBS volume
+          DEVICE=/dev/xvdf
+          MOUNT=/opt/minecraft/world
+
+          # Format only if not already formatted (idempotent on restarts)
+          if ! blkid "$DEVICE"; then
+            mkfs.ext4 "$DEVICE"
+          fi
+          mkdir -p "$MOUNT"
+          mount "$DEVICE" "$MOUNT"
+          echo "$DEVICE $MOUNT ext4 defaults,nofail 0 2" >> /etc/fstab
+
+          mkdir -p /opt/minecraft/server
+          cd /opt/minecraft/server
+
+          # Resolve the server JAR download URL from Mojang's version manifest
+          MANIFEST_URL="https://launchermeta.mojang.com/mc/game/version_manifest.json"
+          VERSION_URL=$(curl -s "$MANIFEST_URL" | \
+            jq -r --arg v "${MinecraftVersion}" \
+            '.versions[] | select(.id == $v) | .url')
+          JAR_URL=$(curl -s "$VERSION_URL" | jq -r '.downloads.server.url')
+          curl -o server.jar "$JAR_URL"
+
+          # Accept EULA (required to run the server)
+          echo "eula=true" > eula.txt
+
+          # server.properties -- basic configuration
+          cat > server.properties <<'PROPS'
+          online-mode=true
+          max-players=10
+          view-distance=10
+          difficulty=normal
+          PROPS
+
+          # systemd service with graceful shutdown (sends 'stop' command via stdin)
+          cat > /etc/systemd/system/minecraft.service <<UNIT
+          [Unit]
+          Description=Minecraft Java Edition Server
+          After=network.target
+
+          [Service]
+          WorkingDirectory=/opt/minecraft/server
+          ExecStart=/usr/bin/java -Xmx${ServerMemoryMB}M -Xms${ServerMemoryMB}M \
+            -jar server.jar nogui
+          ExecStop=/bin/kill -s INT \$MAINPID
+          Restart=on-failure
+          RestartSec=10
+          StandardInput=null
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          systemctl daemon-reload
+          systemctl enable --now minecraft
+
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-minecraft
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  WorldVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      InstanceId: !Ref MinecraftInstance
+      VolumeId: !Ref WorldVolume
+      Device: /dev/xvdf
+
+  MinecraftEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref MinecraftInstance
+
+Outputs:
+  ServerAddress:
+    Description: Connect to this address in Minecraft
+    Value: !Sub ${MinecraftEIP}:25565
+
+  PublicIP:
+    Description: Server public IP
+    Value: !Ref MinecraftEIP
+
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref MinecraftInstance
+
+  WorldVolumeId:
+    Description: EBS Volume ID for world data (retained on stack deletion)
+    Value: !Ref WorldVolume

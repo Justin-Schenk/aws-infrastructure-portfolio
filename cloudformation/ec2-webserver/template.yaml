@@ -1,0 +1,108 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EC2 instance deployed into the public subnet exported by the vpc-baseline
+  stack. Includes a security group allowing SSH (restricted to a single IP)
+  and HTTP/HTTPS, an Elastic IP, and userdata that installs and starts nginx.
+  Designed to be layered on top of the vpc-baseline stack via cross-stack
+  references.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+    Description: EC2 instance type. t3.micro is free-tier eligible.
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 key pair for SSH access.
+
+  SSHAllowedCIDR:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: >
+      CIDR block allowed to SSH in. Restrict to your IP in production
+      (e.g. 203.0.113.5/32). Left open here for lab/demo use.
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Automatically resolves to the latest Amazon Linux 2023 AMI.
+
+Resources:
+
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP, HTTPS, and SSH
+      VpcId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHAllowedCIDR
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-webserver-sg
+
+  WebServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-PublicSubnet1
+      SecurityGroupIds:
+        - !Ref WebServerSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          yum update -y
+          yum install -y nginx
+          systemctl enable nginx
+          systemctl start nginx
+          echo "<h1>Deployed via CloudFormation - ${EnvironmentName}</h1>" \
+            > /usr/share/nginx/html/index.html
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-webserver
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  WebServerEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref WebServerInstance
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-webserver-eip
+
+Outputs:
+  PublicIP:
+    Description: Public IP of the web server
+    Value: !Ref WebServerEIP
+
+  PublicDNS:
+    Description: Public DNS of the web server
+    Value: !GetAtt WebServerInstance.PublicDnsName
+
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref WebServerInstance

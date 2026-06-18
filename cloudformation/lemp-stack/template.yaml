@@ -1,0 +1,157 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  LEMP stack (Linux, Nginx, MySQL/MariaDB, PHP) on a single EC2 instance.
+  Bootstrapped entirely via UserData -- no manual post-launch configuration
+  required. Derived from CS312 System Administration coursework at Oregon
+  State University, parameterized and hardened for portfolio use.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+
+  SSHAllowedCIDR:
+    Type: String
+    Default: 0.0.0.0/0
+
+  DBName:
+    Type: String
+    Default: appdb
+    Description: Name of the MariaDB database to create on bootstrap.
+
+  DBUser:
+    Type: String
+    Default: appuser
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: MariaDB password. Not echoed in CloudFormation console.
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+
+  LEMPSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: LEMP stack - HTTP, HTTPS, SSH
+      VpcId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHAllowedCIDR
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-lemp-sg
+
+  LEMPInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-PublicSubnet1
+      SecurityGroupIds:
+        - !Ref LEMPSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+
+          # Package installation
+          dnf update -y
+          dnf install -y nginx mariadb105-server php8.2 php8.2-fpm php8.2-mysqlnd
+
+          # Enable and start services
+          systemctl enable --now nginx
+          systemctl enable --now mariadb
+          systemctl enable --now php-fpm
+
+          # Secure MariaDB and create app database/user
+          mysql -u root <<EOF
+          ALTER USER 'root'@'localhost' IDENTIFIED BY '${DBPassword}';
+          CREATE DATABASE IF NOT EXISTS ${DBName};
+          CREATE USER IF NOT EXISTS '${DBUser}'@'localhost' IDENTIFIED BY '${DBPassword}';
+          GRANT ALL PRIVILEGES ON ${DBName}.* TO '${DBUser}'@'localhost';
+          FLUSH PRIVILEGES;
+          EOF
+
+          # Configure Nginx to proxy PHP-FPM
+          cat > /etc/nginx/conf.d/lemp.conf <<'NGINXCONF'
+          server {
+              listen 80;
+              root /var/www/html;
+              index index.php index.html;
+
+              location / {
+                  try_files $uri $uri/ =404;
+              }
+
+              location ~ \.php$ {
+                  fastcgi_pass unix:/run/php-fpm/www.sock;
+                  fastcgi_index index.php;
+                  fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+                  include fastcgi_params;
+              }
+          }
+          NGINXCONF
+
+          # Basic info page to confirm stack is working
+          mkdir -p /var/www/html
+          cat > /var/www/html/index.php <<'PHPEOF'
+          <?php
+          echo "<h1>LEMP Stack - Deployed via CloudFormation</h1>";
+          echo "<p>PHP version: " . phpversion() . "</p>";
+          $conn = new mysqli("localhost", "${DBUser}", "${DBPassword}", "${DBName}");
+          echo $conn->connect_error
+            ? "<p>DB: Connection failed</p>"
+            : "<p>DB: Connected to ${DBName}</p>";
+          ?>
+          PHPEOF
+
+          nginx -t && systemctl reload nginx
+
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-lemp
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  LEMPEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref LEMPInstance
+
+Outputs:
+  PublicIP:
+    Description: LEMP stack public IP
+    Value: !Ref LEMPEIP
+
+  WebURL:
+    Description: URL to verify the LEMP stack is running
+    Value: !Sub http://${LEMPEIP}/index.php

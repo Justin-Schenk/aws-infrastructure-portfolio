@@ -35,7 +35,7 @@ systemctl enable --now mariadb
 systemctl enable --now php-fpm
 
 # ---------------------------------------------------------------------------
-# MariaDB setup (idempotent: CREATE IF NOT EXISTS)
+# MariaDB setup
 # ---------------------------------------------------------------------------
 log "Configuring MariaDB..."
 mysql -u root <<SQL
